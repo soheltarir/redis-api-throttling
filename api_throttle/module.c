@@ -4,12 +4,12 @@
 #include <string.h>
 
 
- RedisModuleString *getCacheKey(RedisModuleCtx *ctx, const char *viewName, const char *userId) {
+ RedisModuleString *getCacheKey(RedisModuleCtx *ctx, const char *viewName, const char *userId, long long ldRedisDb) {
 	/*
 	This function returns the seconds after which the cache key should be expired.
 	*/
 	char strCacheKey[255];
-	sprintf(strCacheKey, "throttle_%s_%s", viewName, userId);
+	sprintf(strCacheKey, ":%lld:throttle_%s_%s", ldRedisDb, viewName, userId);
 	// Convert to RedisModuleString
 	RedisModuleString *rstrCacheKey;
 	rstrCacheKey = RedisModule_CreateString(ctx, strCacheKey, strlen(strCacheKey));
@@ -19,12 +19,21 @@
 
 int CheckRateLimit(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
 	/*
-	Arguments should be <apiViewName> <userId> <maxLimit> <per hour/min>
+	Arguments should be <apiViewName> <userId> <maxLimit> <per hour/min> <redisDB>
 	*/
 	// We must have at least 5 arguments
 	if (argc < 5) {
 		return RedisModule_WrongArity(ctx);
 	}
+	// Get the Correct Redis DB
+	long long ldRedisDb;
+	if (argc != 6) {
+		ldRedisDb = 0;
+	}
+	else if (RedisModule_StringToLongLong(argv[5], &ldRedisDb) != REDISMODULE_OK) {
+		ldRedisDb = 0;
+	}
+
 	RedisModule_AutoMemory(ctx);
 
 	size_t view_name_len, user_id_len, identifier_len;
@@ -32,7 +41,7 @@ int CheckRateLimit(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
 
 	const char *viewName = RedisModule_StringPtrLen(argv[1], &view_name_len);
 	const char *userId = RedisModule_StringPtrLen(argv[2], &user_id_len);
-
+	
 	const char *identifier = RedisModule_StringPtrLen(argv[4], &identifier_len);
 	if (strcmp(identifier, "min") == 0) {
 		dCacheKeyTTL = 60 * 1000;
@@ -50,46 +59,46 @@ int CheckRateLimit(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
         return RedisModule_ReplyWithError(ctx, "Unable to read rate limit provided.");
     }
 	
-	RedisModuleString *rstrCacheKey = getCacheKey(ctx, viewName, userId); 
+	RedisModuleString *rstrCacheKey = getCacheKey(ctx, viewName, userId, ldRedisDb); 
+	RedisModule_SelectDb(ctx, ldRedisDb);
 	RedisModuleKey *key = RedisModule_OpenKey(ctx, rstrCacheKey, REDISMODULE_READ | REDISMODULE_WRITE);
 
+	RedisModuleString *rstrReply;
+	long ttl;
+
 	if (RedisModule_KeyType(key) == REDISMODULE_KEYTYPE_EMPTY) {
-		RedisModule_StringSet(key, RedisModule_CreateStringFromLongLong(ctx,1));
+		RedisModule_StringSet(key, RedisModule_CreateStringFromLongLong(ctx, 1));
 		// Set Expiry
 		RedisModule_SetExpire(key, dCacheKeyTTL);
+		ttl = dCacheKeyTTL/1000;
 		count = 1;
 	}
 	else if (RedisModule_KeyType(key) == REDISMODULE_KEYTYPE_STRING) {
-		// Read the current value
-		size_t len;
-		char *currValue = RedisModule_StringDMA(key, &len, REDISMODULE_READ);
-		RedisModule_CloseKey(key);
-		if (atoi(currValue) > maxLimit) {
-			return RedisModule_ReplyWithLongLong(ctx, 0);
-		}
-		else {
-			RedisModuleCallReply *rep = RedisModule_Call(ctx, "INCR", "s", rstrCacheKey);
-			if (RedisModule_CallReplyType(rep) == REDISMODULE_REPLY_INTEGER) {
-				count = RedisModule_CallReplyInteger(rep);
-			}
-			else {
-				RedisModule_ReplyWithError(ctx, "INCR Command failed.");
-	        	return REDISMODULE_ERR;
-			}
-		}
+		ttl = (long)RedisModule_GetExpire(key)/1000;
+		size_t key_value_len;
+		char* strCurrCount = RedisModule_StringDMA(key, &key_value_len, REDISMODULE_WRITE);
+		count = atoi(strCurrCount) + 1;
+		sprintf(strCurrCount, "%lld", count);
 	}
 	else {
 		RedisModule_ReplyWithError(ctx, "Error Opening Key!");
         return REDISMODULE_ERR;
 	}
+	RedisModule_CloseKey(key);
 
 	RedisModule_FreeString(ctx, rstrCacheKey);
 
 	if (count <= maxLimit) {
-		return RedisModule_ReplyWithLongLong(ctx, 1);
+		char strReply[32];
+		sprintf(strReply, "%s|%ld", "TRUE", ttl);
+		rstrReply = RedisModule_CreateString(ctx, strReply, strlen(strReply));
+		return RedisModule_ReplyWithString(ctx, rstrReply);
 	}
 	else {
-		return RedisModule_ReplyWithLongLong(ctx, 0);
+		char strReply[32];
+		sprintf(strReply, "%s|%ld", "FALSE", ttl);
+		rstrReply = RedisModule_CreateString(ctx, strReply, strlen(strReply));
+		return RedisModule_ReplyWithString(ctx, rstrReply);
 	}
 }
 
